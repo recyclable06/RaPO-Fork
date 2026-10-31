@@ -37,6 +37,7 @@ from ...utils.fsdp_utils import (
     offload_fsdp_submodule,
 )
 from ...utils.model_utils import print_gpu_memory_usage
+from ...utils.full_lora import gather_effective_lora_weights
 from ...utils.vllm_utils import TensorLoRARequest
 from .base import BaseShardingManager
 
@@ -55,6 +56,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.use_param_offload = use_param_offload
         self.loaded = False
         self.is_lora = isinstance(self.module._fsdp_wrapped_module, PeftModel)
+        self.full_lora = getattr(self.module._fsdp_wrapped_module, "_rapo_full_lora", False)
+        self.is_lora = self.is_lora and not self.full_lora
 
         self.world_size = dist.get_world_size()
         self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
@@ -133,7 +136,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.use_param_offload and not self.is_lora:
             load_fsdp_model(self.module)
 
-        if self.is_lora:
+        if self.full_lora:
+            actor_weights = gather_effective_lora_weights(self.module)
+            actor_weights = self._rename_weight_keys(actor_weights, self.module._fsdp_wrapped_module.get_base_model())
+        elif self.is_lora:
             peft_config = self.module._fsdp_wrapped_module.peft_config.get("default", None)
             actor_weights = self._collect_lora_weights()
         else:

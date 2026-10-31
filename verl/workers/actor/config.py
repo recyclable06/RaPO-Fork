@@ -24,10 +24,13 @@ from typing import Any, Optional
 class LoraConfig:
     rank: int = 0
     alpha: int = 64
+    full_coverage: bool = False
     target_modules: str = "all-linear"
     exclude_modules: Optional[str] = None
 
     def post_init(self):
+        if self.full_coverage and self.rank <= 0:
+            raise ValueError("lora.full_coverage requires a positive lora.rank.")
         if not isinstance(self.target_modules, str):
             raise TypeError("lora.target_modules must be a string like 'all-linear' or 'q_proj,k_proj,v_proj,o_proj'.")
 

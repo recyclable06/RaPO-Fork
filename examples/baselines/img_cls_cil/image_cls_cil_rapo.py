@@ -58,6 +58,7 @@ from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.config import PPOConfig
 from verl.trainer.ray_trainer import ResourcePoolManager, Role
 from verl.utils.fsdp_utils import load_fsdp_model, offload_fsdp_model
+from verl.utils.full_lora import gather_effective_lora_weights
 from verl.utils.tokenizer import get_processor, get_tokenizer
 from verl.workers.fsdp_workers import FSDPWorker
 from verl.workers.reward import AutoRewardManager
@@ -179,7 +180,7 @@ class PersistentRefFSDPWorker(_FSDPWorkerColocBase, FSDPWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def copy_actor_to_anchor(self) -> None:
-        """Copy actor FSDP flat-param weights to the anchor FSDP module."""
+        """Snapshot the previous task's effective policy into the frozen anchor."""
         if not getattr(self, "_has_anchor", False) or not hasattr(self, "anchor_fsdp_module"):
             raise RuntimeError("copy_actor_to_anchor called without an initialised anchor module")
 
@@ -188,12 +189,22 @@ class PersistentRefFSDPWorker(_FSDPWorkerColocBase, FSDPWorker):
         if self._use_ref_param_offload:
             load_fsdp_model(self.anchor_fsdp_module)
 
-        with torch.no_grad():
-            for p_a, p_t in zip(
-                self.fsdp_module.parameters(),
-                self.anchor_fsdp_module.parameters(),
-            ):
-                p_t.data.copy_(p_a.data.to(p_t.dtype))
+        if self._full_lora:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+            weights = gather_effective_lora_weights(self.fsdp_module)
+            set_model_state_dict(
+                self.anchor_fsdp_module, weights,
+                options=StateDictOptions(full_state_dict=True, strict=True),
+            )
+            del weights
+        else:
+            with torch.no_grad():
+                for p_a, p_t in zip(
+                    self.fsdp_module.parameters(),
+                    self.anchor_fsdp_module.parameters(),
+                ):
+                    p_t.data.copy_(p_a.data.to(p_t.dtype))
 
         import torch.distributed as dist
         dist.barrier()

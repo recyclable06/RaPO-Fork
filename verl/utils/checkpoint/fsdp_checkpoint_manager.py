@@ -125,7 +125,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             self.model._fsdp_wrapped_module.generation_config.save_pretrained(hf_path)
             self.processing_class.save_pretrained(hf_path)
 
-        if isinstance(self.model._fsdp_wrapped_module, PeftModel):
+        # The normal model shards already contain all LoRA and direct vector
+        # updates. A PEFT-only adapter export omits the norm vectors in this mode.
+        full_lora = getattr(self.model._fsdp_wrapped_module, "_rapo_full_lora", False)
+        if isinstance(self.model._fsdp_wrapped_module, PeftModel) and not full_lora:
             lora_path = os.path.join(path, "lora_adapter")
             peft_config = {}
             if self.rank == 0:

@@ -20,6 +20,10 @@ TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-2}
 PROJECT_NAME=${PROJECT_NAME:-rft_continual_learning}
 KL_COEF=${KL_COEF:-2e-3}
+LORA_FULL_COVERAGE=${LORA_FULL_COVERAGE:-false}
+LORA_RANK=${LORA_RANK:-0}
+LORA_ALPHA=${LORA_ALPHA:-64}
+ACTOR_LR=${ACTOR_LR:-1e-6}
 DATA_ROOT_BASE=${DATA_ROOT_BASE:-$ROOT_DIR/data/image_cls_cil_dataset}
 DATA_ROOT=${DATA_ROOT:-$DATA_ROOT_BASE/imagenet-r}
 TRAIN_FILES=${TRAIN_FILES:-$DATA_ROOT/train_5shots}
@@ -29,10 +33,14 @@ INCREMENTAL_CLASSES=20
 TASK_SETTING=10task
 DATASET_ID=inr
 
-CLASS_ORDER_SEEDS=(1990 1993 1996)
+METHOD=rapo
+if [[ "$LORA_FULL_COVERAGE" == true ]]; then
+  METHOD="rapo_full_lora_r${LORA_RANK}"
+fi
+read -r -a CLASS_ORDER_SEEDS <<< "${CLASS_ORDER_SEEDS:-1990 1993 1996}"
 for CLASS_ORDER_SEED in "${CLASS_ORDER_SEEDS[@]}"; do
-  EXP_NAME="image_cls_cil_rapo_${DATASET_ID}_${TASK_SETTING}_s${CLASS_ORDER_SEED}"
-  OUT_DIR="$SAVE_ROOT/image_cls_cil/rapo/$DATASET_ID/$TASK_SETTING/seed$CLASS_ORDER_SEED"
+  EXP_NAME="image_cls_cil_${METHOD}_${DATASET_ID}_${TASK_SETTING}_s${CLASS_ORDER_SEED}"
+  OUT_DIR="$SAVE_ROOT/image_cls_cil/$METHOD/$DATASET_ID/$TASK_SETTING/seed$CLASS_ORDER_SEED"
   mkdir -p "$OUT_DIR"
 
   python -m examples.baselines.img_cls_cil.image_cls_cil_rapo \
@@ -49,6 +57,10 @@ for CLASS_ORDER_SEED in "${CLASS_ORDER_SEEDS[@]}"; do
     data.rollout_batch_size="$ROLLOUT_BATCH_SIZE" \
     algorithm.kl_coef="$KL_COEF" \
     worker.actor.model.model_path="$MODEL_PATH" \
+    worker.actor.model.lora.full_coverage="$LORA_FULL_COVERAGE" \
+    worker.actor.model.lora.rank="$LORA_RANK" \
+    worker.actor.model.lora.alpha="$LORA_ALPHA" \
+    worker.actor.optim.lr="$ACTOR_LR" \
     worker.actor.global_batch_size="$ACTOR_GLOBAL_BATCH_SIZE" \
     worker.actor.micro_batch_size_per_device_for_update="$ACTOR_MICRO_BATCH_SIZE_UPDATE" \
     worker.actor.micro_batch_size_per_device_for_experience="$ACTOR_MICRO_BATCH_SIZE_EXPERIENCE" \

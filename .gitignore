@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+saves/
+data/image_cls_cil_dataset/
+data/video_cls_cil_dataset/
+data/object_det_cil_dataset_rebuilt/
+.DS_Store

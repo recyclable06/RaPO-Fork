@@ -46,6 +46,7 @@ from ..single_controller.base.decorator import Dispatch, register
 from ..utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from ..utils.dataset import process_image, process_video
 from ..utils.flops_counter import FlopsCounter
+from ..utils.full_lora import apply_full_lora
 from ..utils.fsdp_utils import (
     get_fsdp_wrap_policy,
     get_init_fn,
@@ -98,6 +99,8 @@ class FSDPWorker(Worker):
 
         self._lora_rank = self.config.actor.model.lora.rank
         self._is_lora = self._lora_rank > 0
+        self._full_lora = self._is_lora and self.config.actor.model.lora.full_coverage
+        self._shared_lora_ref = self._is_lora and not self._full_lora
 
         self._use_param_offload = False
         self._use_optimizer_offload = False
@@ -236,24 +239,33 @@ class FSDPWorker(Worker):
         if is_lora_model:
             self.print_rank0("Applying LoRA to actor module")
             model.enable_input_require_grads()
-            if model_config.lora.target_modules == "all-linear":
-                target_modules = model_config.lora.target_modules
+            if self._full_lora:
+                if model_config.freeze_vision_tower:
+                    raise ValueError("Whole-model LoRA requires freeze_vision_tower=false.")
+                model, counts = apply_full_lora(model, model_config.lora.rank, model_config.lora.alpha)
+                self.print_rank0(f"Whole-model LoRA parameter counts: {counts}; uncovered=[]")
+                # Mixed frozen weights and trainable vectors share each block.
+                fsdp_config.use_orig_params = True
             else:
-                target_modules = [item.strip() for item in model_config.lora.target_modules.split(",") if item.strip()]
-
-            lora_config = peft.LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=model_config.lora.rank,
-                lora_alpha=model_config.lora.alpha,
-                target_modules=target_modules,
-                exclude_modules=model_config.lora.exclude_modules,
-            )
-            model = get_peft_model(model, lora_config)
-            for p in model.parameters():
-                if not p.requires_grad:
-                    p.data = p.to(torch.bfloat16)
+                if model_config.lora.target_modules == "all-linear":
+                    target_modules = model_config.lora.target_modules
                 else:
-                    p.data = p.to(torch_dtype)
+                    target_modules = [item.strip() for item in model_config.lora.target_modules.split(",") if item.strip()]
+                lora_config = peft.LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=model_config.lora.rank,
+                    lora_alpha=model_config.lora.alpha,
+                    target_modules=target_modules,
+                    exclude_modules=model_config.lora.exclude_modules,
+                )
+                model = get_peft_model(model, lora_config)
+            # A full-coverage FSDP unit contains both frozen and trainable params;
+            # they need one dtype. Keep the original selective-LoRA behavior.
+            if self._full_lora:
+                model = model.to(torch_dtype)
+            else:
+                for p in model.parameters():
+                    p.data = p.to(torch_dtype if p.requires_grad else torch.bfloat16)
         else:
             model = model.to(torch_dtype)
 
@@ -281,7 +293,9 @@ class FSDPWorker(Worker):
             buffer_dtype=PrecisionType.to_dtype(fsdp_config.mp_buffer_dtype),
             cast_forward_inputs=True,
         )
-        auto_wrap_policy = get_fsdp_wrap_policy(model, is_lora_model=is_lora_model)
+        # Keep tied embedding/head factors in the root unit. Only transformer
+        # blocks are nested FSDP units in whole-model mode.
+        auto_wrap_policy = get_fsdp_wrap_policy(model, is_lora_model=is_lora_model and not self._full_lora)
         self.print_rank0(f"FSDP wrap policy: {auto_wrap_policy}.")
 
         if self.device_mesh.ndim == 2:
@@ -387,7 +401,7 @@ class FSDPWorker(Worker):
         rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
         lora_kwargs = (
             {"lora_kwargs": {"enable_lora": True, "max_loras": 1, "max_lora_rank": self._lora_rank}}
-            if self._is_lora
+            if self._is_lora and not self._full_lora
             else {}
         )
         self.rollout = vLLMRollout(
@@ -426,7 +440,7 @@ class FSDPWorker(Worker):
             )
 
         if self._has_ref:
-            if self._is_lora:
+            if self._shared_lora_ref:
                 self.ref_fsdp_module = self.fsdp_module
             else:
                 self._build_model_optimizer(
@@ -665,15 +679,15 @@ class FSDPWorker(Worker):
     def compute_ref_log_probs(self, data: DataProto):
         assert self._has_ref
 
-        # when is_lora is True, we use the actor without lora applied to calculate the log_prob
-        # which is mostly used for ref log_prob calculation
-        adapter_ctx = self.ref_fsdp_module.disable_adapter() if self._is_lora else nullcontext()
+        # Selective LoRA can share the frozen base. Whole-model mode directly
+        # trains vectors, so it uses the independent original Ref instead.
+        adapter_ctx = self.ref_fsdp_module.disable_adapter() if self._shared_lora_ref else nullcontext()
 
         self._process_multi_modal_inputs(data)
         data = data.to(torch.cuda.current_device())
 
-        # the fsdp module is the same as the ref fsdp module when lora is enabled
-        if self._use_ref_param_offload or (self._is_lora and self._use_param_offload):
+        # Only the selective-LoRA reference shares Actor's offload lifecycle.
+        if self._use_ref_param_offload or (self._shared_lora_ref and self._use_param_offload):
             load_fsdp_model(self.ref_fsdp_module)
 
         data.meta_info["temperature"] = self.config.rollout.temperature
@@ -688,7 +702,7 @@ class FSDPWorker(Worker):
         if self.world_size > 1:
             self.ref_fsdp_module._handle.reshard(True)
 
-        if self._use_ref_param_offload or (self._is_lora and self._use_param_offload):
+        if self._use_ref_param_offload or (self._shared_lora_ref and self._use_param_offload):
             offload_fsdp_model(self.ref_fsdp_module)
 
         output = output.to("cpu")
