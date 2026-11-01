@@ -12,6 +12,10 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from peft.tuners.lora.layer import LoraLayer
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate
+
+
+_MERGE_ROWS = 1024
 
 
 class TiedLoraHead(nn.Module):
@@ -96,7 +100,7 @@ def _clean_name(name):
 
 @torch.no_grad()
 def effective_lora_state_dict(model: PeftModel, state_dict: dict) -> dict:
-    """Merge a FULL gathered state dict without changing Actor or its optimizer.
+    """Small-model reference formula for numerical checks, not production sync.
 
     FSDP collection is done by the caller. Metadata comes from the live layers;
     all numerical operations use gathered tensors, never local FSDP shards.
@@ -140,9 +144,122 @@ def effective_lora_state_dict(model: PeftModel, state_dict: dict) -> dict:
     return result
 
 
-def gather_effective_lora_weights(module):
-    """Collect once on every rank, using the same FSDP state-dict API as rollout."""
+def cpu_sharded_state_dict(module):
+    """Stage local state shards while vLLM sleeps; never collect a full model."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-    state = get_model_state_dict(module, options=StateDictOptions(full_state_dict=True))
-    return effective_lora_state_dict(module._fsdp_wrapped_module, state)
+    return get_model_state_dict(module, options=StateDictOptions(full_state_dict=False, cpu_offload=True))
+
+
+@torch.no_grad()
+def _merge_weight_rows(weight, a, b, scaling, embedding):
+    """Allocate one output matrix; FP32 workspace is limited to a row block."""
+    left, right = (a.T, b.T) if embedding else (b.flatten(1), a.flatten(1))
+    right = right.float()
+    output = torch.empty_like(weight, memory_format=torch.contiguous_format)
+    for start in range(0, weight.shape[0], _MERGE_ROWS):
+        stop = min(start + _MERGE_ROWS, weight.shape[0])
+        block = left[start:stop].float() @ right
+        block.mul_(scaling)
+        block.add_(weight[start:stop].reshape(stop - start, -1))
+        output[start:stop].copy_(block.reshape(output[start:stop].shape))
+        del block
+    return output
+
+
+def _full_weight(shard, device):
+    # Offloaded DTensors still carry the CUDA mesh. Move the local shard back
+    # before collective communication; NCCL cannot all-gather CPU tensors.
+    tensor = shard.to(device)
+    return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+
+
+@torch.no_grad()
+def iter_effective_lora_weights(model: PeftModel, cpu_state: dict, device):
+    """Yield complete ordinary weights, retaining only the current GPU matrix.
+
+    Every rank drives this iterator in the same order, independently of whether
+    a receiver consumes a name. The caller must release each yielded weight
+    before requesting the next one. Shapes come from the snapshot, not FSDP's
+    live (possibly flattened/empty) parameter views.
+    """
+    state = {_clean_name(name): value for name, value in cpu_state.items()}
+    sources = {name.replace(".base_layer.", "."): name for name in state if ".lora_" not in name}
+    merges = {}
+    embedding_name = None
+    tied_heads = []
+    for raw_name, layer in model.named_modules():
+        name = _clean_name(raw_name)
+        if isinstance(layer, TiedLoraHead):
+            tied_heads.append(f"{name}.weight")
+        elif isinstance(layer, LoraLayer):
+            embedding = isinstance(layer.get_base_layer(), nn.Embedding)
+            if embedding:
+                a, b = f"{name}.lora_embedding_A.default", f"{name}.lora_embedding_B.default"
+                if layer is model.get_input_embeddings():
+                    embedding_name = f"{name}.weight"
+            else:
+                a, b = f"{name}.lora_A.default.weight", f"{name}.lora_B.default.weight"
+            merges[f"{name}.weight"] = (a, b, layer.scaling["default"], embedding)
+    if tied_heads and embedding_name is None:
+        raise ValueError("Tied output head has no adapted input embedding")
+
+    for name in sorted(sources):
+        if name in tied_heads:
+            continue  # Emitted with the source embedding, without a second merge.
+        weight = _full_weight(state[sources[name]], device)
+        if name in merges:
+            a_name, b_name, scaling, embedding = merges[name]
+            a = _full_weight(state[a_name], device)
+            b = _full_weight(state[b_name], device)
+            effective = _merge_weight_rows(weight, a, b, scaling, embedding)
+            del weight, a, b
+        else:
+            effective = weight
+            del weight
+        yield name, effective
+        if name == embedding_name:
+            for head in sorted(tied_heads):
+                yield head, effective
+        del effective
+
+
+@torch.no_grad()
+def _anchor_shard(weight, template):
+    if weight.shape != template.shape:
+        raise ValueError(f"Anchor weight shape mismatch: {weight.shape} != {template.shape}")
+    weight = weight.to(template.dtype)
+    if isinstance(template, DTensor):
+        # Each rank already computed the same complete matrix. Public DTensor
+        # redistribution performs local chunking from Replicate to Shard, using
+        # the target layout (including uneven/empty shards), not flat offsets.
+        replicated = DTensor.from_local(
+            weight, device_mesh=template.device_mesh,
+            placements=[Replicate()] * template.device_mesh.ndim,
+        )
+        return replicated.redistribute(placements=template.placements).cpu()
+    return weight.cpu()
+
+
+@torch.no_grad()
+def copy_effective_lora_to_anchor(actor, anchor):
+    """Build local CPU target shards, then load Anchor once in sharded mode."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    actor_state = cpu_sharded_state_dict(actor)
+    remaining = cpu_sharded_state_dict(anchor)
+    target_names = {_clean_name(name): name for name in remaining}
+    updates = {}
+    device = torch.device("cuda", torch.cuda.current_device())
+    for name, weight in iter_effective_lora_weights(actor._fsdp_wrapped_module, actor_state, device):
+        target = target_names[name]
+        template = remaining.pop(target)
+        updates[target] = _anchor_shard(weight, template)
+        del template, weight
+    if remaining:
+        raise ValueError(f"Anchor parameters missing from effective policy: {sorted(remaining)}")
+    del actor_state
+    set_model_state_dict(
+        anchor, updates,
+        options=StateDictOptions(full_state_dict=False, cpu_offload=True, strict=True),
+    )

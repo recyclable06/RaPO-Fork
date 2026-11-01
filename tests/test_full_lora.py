@@ -6,11 +6,20 @@ Run: python -m unittest discover -s tests -p test_full_lora.py -v
 import copy
 import io
 import unittest
+from unittest.mock import patch
 
 import torch
 from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 
-from verl.utils.full_lora import apply_full_lora, effective_lora_state_dict
+from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+from verl.utils.full_lora import (
+    _anchor_shard,
+    apply_full_lora,
+    cpu_sharded_state_dict,
+    effective_lora_state_dict,
+    iter_effective_lora_weights,
+)
 
 
 def tiny_model():
@@ -31,6 +40,42 @@ def tiny_model():
 
 
 class FullLoraTest(unittest.TestCase):
+    def test_blocked_sync_matches_reference(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(13)
+                plain = tiny_model().to(dtype).eval()
+                anchor = copy.deepcopy(plain).requires_grad_(False)
+                actor, _ = apply_full_lora(plain, rank=3, alpha=7)
+                with torch.no_grad():
+                    for param in actor.parameters():
+                        if param.requires_grad:
+                            param.add_(torch.randn_like(param) * 0.03)
+                before = {name: value.clone() for name, value in actor.state_dict().items()}
+                reference = effective_lora_state_dict(actor, before)
+                snapshot = cpu_sharded_state_dict(actor)
+                self.assertTrue(all(value.device.type == "cpu" for value in snapshot.values()))
+                # Force non-divisible row blocks for linear, embedding, Conv3d.
+                with patch("verl.utils.full_lora._MERGE_ROWS", 7):
+                    weights = dict(iter_effective_lora_weights(actor, snapshot, torch.device("cpu")))
+                self.assertEqual(weights.keys(), reference.keys())
+                for name, value in weights.items():
+                    self.assertEqual(value.shape, reference[name].shape)
+                    self.assertEqual(value.dtype, dtype)
+                    torch.testing.assert_close(value, reference[name])
+                embedding_name = next(name for name in weights if name.endswith("embed_tokens.weight"))
+                self.assertIs(weights[embedding_name], weights["lm_head.weight"])
+                for name, value in actor.state_dict().items():
+                    self.assertTrue(torch.equal(value, before[name]), name)
+
+                # CPU tensors exercise the merge/name/shape/writeback path.
+                # Actual FSDP DTensor layouts still require the cluster run.
+                templates = cpu_sharded_state_dict(anchor)
+                updates = {name: _anchor_shard(value, templates[name]) for name, value in weights.items()}
+                set_model_state_dict(anchor, updates, options=StateDictOptions(full_state_dict=False, strict=True))
+                for name, value in anchor.state_dict().items():
+                    torch.testing.assert_close(value, reference[name])
+
     def test_update_merge_anchor_and_reload(self):
         torch.manual_seed(7)
         original = tiny_model().eval()

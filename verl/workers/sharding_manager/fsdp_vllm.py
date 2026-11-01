@@ -37,7 +37,7 @@ from ...utils.fsdp_utils import (
     offload_fsdp_submodule,
 )
 from ...utils.model_utils import print_gpu_memory_usage
-from ...utils.full_lora import gather_effective_lora_weights
+from ...utils.full_lora import cpu_sharded_state_dict, iter_effective_lora_weights
 from ...utils.vllm_utils import TensorLoRARequest
 from .base import BaseShardingManager
 
@@ -132,14 +132,25 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         return lora_weights
 
-    def _sync_weight_to_vllm(self):
+    def _sync_weight_to_vllm(self, cpu_actor_state=None):
+        if self.full_lora:
+            peft_model = self.module._fsdp_wrapped_module
+            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            # Drive collectives here, outside the vLLM loader: a skipped alias
+            # must not change which matrix the next rank tries to gather.
+            for name, weight in iter_effective_lora_weights(
+                peft_model, cpu_actor_state, torch.device("cuda", torch.cuda.current_device())
+            ):
+                item = self._rename_weight_keys({name: weight}, peft_model.get_base_model())
+                model.load_weights(item.items())
+                del item, weight
+            print_gpu_memory_usage("After sync model weights in sharding manager")
+            return
+
         if self.use_param_offload and not self.is_lora:
             load_fsdp_model(self.module)
 
-        if self.full_lora:
-            actor_weights = gather_effective_lora_weights(self.module)
-            actor_weights = self._rename_weight_keys(actor_weights, self.module._fsdp_wrapped_module.get_base_model())
-        elif self.is_lora:
+        if self.is_lora:
             peft_config = self.module._fsdp_wrapped_module.peft_config.get("default", None)
             actor_weights = self._collect_lora_weights()
         else:
@@ -183,13 +194,28 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         assert self.loaded is False, "vllm engine has already been loaded"
         self.loaded = True
 
+        cpu_actor_state = None
+        if self.full_lora:
+            if self.use_param_offload:
+                load_fsdp_model(self.module)
+            cpu_actor_state = cpu_sharded_state_dict(self.module)
+            if self.use_param_offload:
+                offload_fsdp_model(self.module)
+            # The snapshot interface can temporarily unshard an FSDP unit.
+            # Finish and release that workspace before allocating vLLM weights.
+            torch.cuda.empty_cache()
+
         print_gpu_memory_usage("Before vllm wake up in sharding manager")
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
             self.inference_engine.wake_up(tags=["weights"])
         else:
             self.inference_engine.wake_up()
 
-        self._sync_weight_to_vllm()
+        self._sync_weight_to_vllm(cpu_actor_state)
+        del cpu_actor_state
+
+        if self.full_lora:
+            torch.cuda.empty_cache()
 
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
             self.inference_engine.wake_up(tags=["kv_cache"])
